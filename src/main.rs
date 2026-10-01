@@ -11,6 +11,41 @@ use clap::Parser;
 use serde::Serialize;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Current UTC time as an RFC 3339 timestamp.
+///
+/// Implemented with `std` only rather than pulling in a date-time crate, so the
+/// release build keeps its current dependency set. `SystemTime` is UTC by
+/// definition, so only the civil-date conversion is needed (Howard Hinnant's
+/// `civil_from_days`).
+fn now_rfc3339() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let (hour, minute, second) = (rem / 3600, (rem % 3600) / 60, rem % 60);
+
+    // Shift the epoch to 0000-03-01 so leap days land at the end of the cycle.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        y, m, d, hour, minute, second
+    )
+}
 
 /// Errors that can occur during lockfile path validation.
 #[derive(Debug, thiserror::Error)]
@@ -167,9 +202,22 @@ fn main() -> Result<()> {
 
         if is_json {
             let total = packages.len();
+            // A package can be both a known-malicious typosquat AND a native
+            // build surface. Counting it in both buckets makes
+            // errors + warnings + passed exceed `total`, so the summary stops
+            // being a partition of the package set. Assign each package to
+            // exactly one bucket, errors taking precedence, and emit results
+            // for the same set the summary counts.
+            let malicious_names: std::collections::HashSet<&str> =
+                malicious.iter().map(|p| p.name.as_str()).collect();
+            let unflagged_surfaces: Vec<_> = surfaces
+                .iter()
+                .filter(|s| !malicious_names.contains(s.package.name.as_str()))
+                .collect();
+
             let errors = malicious.len();
-            let warnings = surfaces.len();
-            let passed = total.saturating_sub(errors + warnings);
+            let warnings = unflagged_surfaces.len();
+            let passed = total - errors - warnings;
 
             let mut results = Vec::new();
             for m in &malicious {
@@ -186,7 +234,7 @@ fn main() -> Result<()> {
                 });
             }
 
-            for surface in &surfaces {
+            for surface in &unflagged_surfaces {
                 let risk_msg = if surface.has_proc_macro {
                     format!(
                         "proc-macro crate: {}@{}",
@@ -212,7 +260,7 @@ fn main() -> Result<()> {
 
             let report = JsonReport {
                 version: "1.0.0".to_string(),
-                timestamp: "2026-09-18T12:00:00Z".to_string(),
+                timestamp: now_rfc3339(),
                 summary: JsonSummary {
                     total,
                     errors,
